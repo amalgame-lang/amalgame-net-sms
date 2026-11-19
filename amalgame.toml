@@ -1,0 +1,27 @@
+# Package manifest — amalgame-net-sms
+#
+# Send SMS through an HTTP gateway : SMS Gateway for Android (a phone
+# and its SIM), Twilio, or any HTTP gateway by template (4G routers,
+# operators). GSM 03.38 text helpers so a message fits in one SMS, and
+# E.164 phone numbers. Pure Amalgame over amalgame-net-http.
+#
+# Written for Kairos (SCADA on-call) but has no Kairos dependency.
+
+[package]
+name              = "amalgame-net-sms"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Send SMS through an HTTP gateway: SMS Gateway for Android (an Android phone and its SIM, local server), Twilio, or any HTTP gateway by template ({to}/{text}/{from}, escaped for JSON or percent-encoded). GSM 03.38 helpers: alphabet check, segment count (160/153 GSM 7-bit, 70/67 UCS-2), transliteration so a text stays in one SMS (ê→e, m³→m3, «→\"), Fit to N segments; E.164 normalisation of typed phone numbers. Pure Amalgame over amalgame-net-http."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.58"
+schema-version    = 1
+
+[stdlib]
+classes   = ["SmsResult", "SmsText", "Phone", "SmsEscape", "SmsGateway"]
+header    = "facade-stub.h"
+namespace = "Amalgame.Net.Sms"
+facade    = "facade.am"
+
+[dependencies]
+amalgame-net-http = ">=0.29.6"
+amalgame-crypto   = ">=0.8.0"

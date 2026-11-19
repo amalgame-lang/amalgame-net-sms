@@ -1,0 +1,102 @@
+// amalgame-net-sms tests : GSM 03.38 text, E.164, escaping, the requests
+// each gateway makes, and Send against tests/fake_gateway.py (port in
+// argument 1 ; the runner starts it).
+namespace SmsTest
+
+import Amalgame.Net.Sms
+import Amalgame.Net.Http
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+public class Program {
+    public static void Check(name: string, ok: bool) {
+        if (ok) { Console.WriteLine("[PASS] " + name) } else { Console.WriteLine("[FAIL] " + name) }
+    }
+
+    public static void Eq(name: string, got: string, want: string) {
+        if (got == want) { Console.WriteLine("[PASS] " + name) }
+        else { Console.WriteLine("[FAIL] " + name + " : got [" + got + "], want [" + want + "]") }
+    }
+
+    public static string Repeat(s: string, n: int) {
+        var out: string = ""
+        for i in 0..n { out = out + s }
+        return out
+    }
+
+    public static void Main(string[] args) {
+        // ── GSM 03.38 ──
+        Program.Check("é è à ù É Ç ä ö ü ñ are GSM 7-bit", SmsText.IsGsm7("Été à Évian : où ? Ça, äöüñ, èù"))
+        Program.Check("ê is not GSM 7-bit (the message would go UCS-2)", !SmsText.IsGsm7("fenêtre"))
+        Program.Eq("160 GSM characters : 1 SMS", String.FromInt(SmsText.Segments(Program.Repeat("a", 160))), "1")
+        Program.Eq("161 GSM characters : 2 SMS", String.FromInt(SmsText.Segments(Program.Repeat("a", 161))), "2")
+        Program.Eq("70 UCS-2 characters : 1 SMS", String.FromInt(SmsText.Segments(Program.Repeat("ê", 70))), "1")
+        Program.Eq("71 UCS-2 characters : 2 SMS", String.FromInt(SmsText.Segments(Program.Repeat("ê", 71))), "2")
+        Program.Eq("€ counts 2 septets (extension table)", String.FromInt(SmsText.Units("€")), "2")
+        let g: string = SmsText.ToGsm7("Débit 0 m³/h – « arrêt » à 3 °C")
+        Program.Eq("ToGsm7 transliterates", g, "Débit 0 m3/h - \" arret \" à 3 degC")
+        Program.Check("ToGsm7's result is GSM 7-bit", SmsText.IsGsm7(g))
+        Program.Eq("unknown character becomes ?", SmsText.ToGsm7("a漢b"), "a?b")
+        let f: string = SmsText.Fit(Program.Repeat("é", 200), 1)
+        Program.Eq("Fit to 1 SMS : 160 septets", String.FromInt(SmsText.Units(f)), "160")
+        Program.Check("Fit marks the cut", String.EndsWith(f, "..."))
+        Program.Eq("Fit keeps a short text", SmsText.Fit("P2 en défaut", 1), "P2 en défaut")
+
+        // ── E.164 ──
+        Program.Eq("national number", Phone.E164("06 12 34 56 78", "33"), "+33612345678")
+        Program.Eq("dots", Phone.E164("06.12.34.56.78", "33"), "+33612345678")
+        Program.Eq("international", Phone.E164("+33 6 12 34 56 78", "33"), "+33612345678")
+        Program.Eq("00 prefix", Phone.E164("0033612345678", "33"), "+33612345678")
+        Program.Eq("other country", Phone.E164("+44 (20) 7946-0958", "33"), "+442079460958")
+        Program.Eq("letters refused", Phone.E164("06 12 AB 56 78", "33"), "")
+        Program.Eq("too short refused", Phone.E164("12", "33"), "")
+        Program.Eq("national without country refused", Phone.E164("0612345678", ""), "")
+
+        // ── Escaping ──
+        Program.Eq("JSON escape", SmsEscape.Json("a\"b\\c\nd"), "a\\\"b\\\\c\\nd")
+        Program.Eq("percent-encoding (UTF-8)", SmsEscape.Url("a b&é+"), "a%20b%26%C3%A9%2B")
+        Program.Eq("base64", SmsEscape.Base64("sms:secret"), "c21zOnNlY3JldA==")
+
+        // ── Requests ──
+        let sg: SmsGateway = SmsGateway.SmsGate("http://127.0.0.1:18080/", "sms", "secret")
+        let b1: HttpRequestBuilder = sg.Build("+33612345678", "P2 \"défaut\"")
+        Program.Eq("SMS Gateway for Android : URL", b1.Url, "http://127.0.0.1:18080/message")
+        Program.Eq("SMS Gateway for Android : method", b1.Method, "POST")
+        Program.Eq("SMS Gateway for Android : Basic auth", b1.Headers.Get("Authorization"), "Basic c21zOnNlY3JldA==")
+        Program.Eq("SMS Gateway for Android : body", b1.Body, "{\"textMessage\":{\"text\":\"P2 \\\"défaut\\\"\"},\"phoneNumbers\":[\"+33612345678\"]}")
+        let tw: SmsGateway = SmsGateway.Twilio("AC123", "tok", "+15005550006")
+        let b2: HttpRequestBuilder = tw.Build("+33612345678", "Pompe P2")
+        Program.Eq("Twilio : URL", b2.Url, "https://api.twilio.com/2010-04-01/Accounts/AC123/Messages.json")
+        Program.Eq("Twilio : form", b2.Body, "To=%2B33612345678&From=%2B15005550006&Body=Pompe%20P2")
+        Program.Eq("Twilio : content type", b2.Headers.Get("Content-Type"), "application/x-www-form-urlencoded")
+        let pTo: string = "{" + "to}"
+        let pText: string = "{" + "text}"
+        let pFrom: string = "{" + "from}"
+        let tg: SmsGateway = SmsGateway.Template("GET", "http://router/cgi-bin/sms_send?number=" + pTo + "&text=" + pText, "", "")
+        let b3: HttpRequestBuilder = tg.Build("+33612345678", "P2 en défaut")
+        Program.Eq("template GET : URL", b3.Url, "http://router/cgi-bin/sms_send?number=%2B33612345678&text=P2%20en%20d%C3%A9faut")
+        let tj: SmsGateway = SmsGateway.Template("POST", "http://op/send", "application/json", "{\"to\":\"" + pTo + "\",\"msg\":\"" + pText + "\",\"from\":\"" + pFrom + "\"}").WithFrom("KAIROS")
+        let b4: HttpRequestBuilder = tj.Build("+33612345678", "a\"b")
+        Program.Eq("template JSON : body", b4.Body, "{\"to\":\"+33612345678\",\"msg\":\"a\\\"b\",\"from\":\"KAIROS\"}")
+
+        // ── Send, against the fake gateway ──
+        if (Args_Count() > 1) {
+            let port: string = Args_Get(1)
+            let gw: SmsGateway = SmsGateway.SmsGate("http://127.0.0.1:" + port, "sms", "secret")
+            let r: SmsResult = gw.Send("+33612345678", "Kairos : P2 en défaut")
+            Program.Check("Send : accepted (" + String.FromInt(r.StatusCode) + ")", r.Ok)
+            Program.Eq("Send : the gateway's message id", r.Id, "m-42")
+            let bad: SmsGateway = SmsGateway.SmsGate("http://127.0.0.1:" + port, "sms", "wrong")
+            let r2: SmsResult = bad.Send("+33612345678", "x")
+            Program.Check("Send : wrong password is a failure (401)", !r2.Ok && r2.StatusCode == 401 && String.Length(r2.Error) > 0)
+            let off: SmsGateway = SmsGateway.SmsGate("http://127.0.0.1:1", "sms", "secret")
+            let r3: SmsResult = off.Send("+33612345678", "x")
+            Program.Check("Send : unreachable gateway is status 0", !r3.Ok && r3.StatusCode == 0)
+            let r4: SmsResult = gw.Send("0612345678", "x")
+            Program.Check("Send : a number not in E.164 is refused before sending", !r4.Ok && r4.StatusCode == -1)
+        } else {
+            Console.WriteLine("[FAIL] no fake gateway port in argument 1")
+        }
+    }
+}

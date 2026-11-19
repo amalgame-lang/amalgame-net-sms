@@ -1,0 +1,435 @@
+// amalgame-net-sms — send SMS through an HTTP gateway.
+//
+//   let gw = SmsGateway.SmsGate("http://192.168.1.20:8080", "sms", "secret")
+//   let r: SmsResult = gw.Send(Phone.E164("06 12 34 56 78", "33"), SmsText.Fit("Pompe P2 en défaut", 1))
+//   // r.Ok, r.StatusCode, r.Id, r.Error
+//
+// Gateways :
+//   SmsGate    SMS Gateway for Android (github.com/capcom6/android-sms-gateway),
+//              local server : an Android phone sends through its SIM.
+//              POST <url>/message, Basic auth, {"textMessage":{"text"},"phoneNumbers"}.
+//   Twilio     POST /2010-04-01/Accounts/<sid>/Messages.json, form To/From/Body.
+//   Template   any other HTTP gateway (4G routers, operators) : method, URL and
+//              body with {to}, {text} and {from}, escaped for the content type
+//              (JSON string, or percent-encoded for forms and URLs).
+//
+// SmsText : GSM 03.38 alphabet, segment count, and transliteration so an
+// alarm fits in one SMS : a single character outside GSM 7-bit (ê, ç, ³,
+// «, ’) switches the whole message to UCS-2, 70 characters instead of 160.
+//
+// Pure Amalgame over amalgame-net-http (HttpClient) and amalgame-crypto
+// (byte helpers). No FFI.
+namespace Amalgame.Net.Sms
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Crypto
+import Amalgame.Net.Http
+import Amalgame.Formats.Json
+
+public class SmsResult {
+    public Ok: bool
+    public StatusCode: int     // HTTP status ; 0 : gateway unreachable ; -1 : refused before sending
+    public Id: string          // the gateway's message id, when it gives one
+    public Error: string
+    public Body: string
+
+    public SmsResult(status: int, body: string, error: string) {
+        this.StatusCode = status
+        this.Ok = status >= 200 && status < 300
+        this.Body = body
+        this.Error = error
+        this.Id = ""
+    }
+}
+
+// ── Text : GSM 03.38, segments, transliteration ──────────────────
+public class SmsText {
+    // GSM 03.38 basic table (one septet each), escape excluded.
+    public static string Basic() {
+        return "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
+    }
+    // Extension table (escape + one septet : two each).
+    public static string Extension() {
+        return "^{}\\[~]|€"
+    }
+
+    // Code points of a UTF-8 string (U+FFFD for a malformed byte).
+    public static List<int> CodePoints(text: string) {
+        let b: List<int> = Bytes.FromString(text)
+        let out: List<int> = new List<int>()
+        let n: int = b.Count()
+        var i: int = 0
+        while (i < n) {
+            let c: int = b.Get(i)
+            if (c < 128) {
+                out.Add(c)
+                i = i + 1
+            } else if (c >= 240 && i + 3 < n) {
+                out.Add((c % 8) * 262144 + (b.Get(i + 1) % 64) * 4096 + (b.Get(i + 2) % 64) * 64 + b.Get(i + 3) % 64)
+                i = i + 4
+            } else if (c >= 224 && i + 2 < n) {
+                out.Add((c % 16) * 4096 + (b.Get(i + 1) % 64) * 64 + b.Get(i + 2) % 64)
+                i = i + 3
+            } else if (c >= 192 && i + 1 < n) {
+                out.Add((c % 32) * 64 + b.Get(i + 1) % 64)
+                i = i + 2
+            } else {
+                out.Add(65533)
+                i = i + 1
+            }
+        }
+        return out
+    }
+
+    public static string FromCodePoints(cps: List<int>) {
+        let b: List<int> = new List<int>()
+        for cp in cps {
+            if (cp < 128) { b.Add(cp) }
+            else if (cp < 2048) {
+                b.Add(192 + cp / 64)
+                b.Add(128 + cp % 64)
+            } else if (cp < 65536) {
+                b.Add(224 + cp / 4096)
+                b.Add(128 + (cp / 64) % 64)
+                b.Add(128 + cp % 64)
+            } else {
+                b.Add(240 + cp / 262144)
+                b.Add(128 + (cp / 4096) % 64)
+                b.Add(128 + (cp / 64) % 64)
+                b.Add(128 + cp % 64)
+            }
+        }
+        return Bytes.ToString(b)
+    }
+
+    public static bool In(set: List<int>, cp: int) {
+        for x in set {
+            if (x == cp) { return true }
+        }
+        return false
+    }
+
+    // Septets of one code point : 1 (basic), 2 (extension), 0 (not GSM).
+    public static int Septets(basic: List<int>, ext: List<int>, cp: int) {
+        if (SmsText.In(basic, cp)) { return 1 }
+        if (SmsText.In(ext, cp)) { return 2 }
+        return 0
+    }
+
+    public static bool IsGsm7(text: string) {
+        let basic: List<int> = SmsText.CodePoints(SmsText.Basic())
+        let ext: List<int> = SmsText.CodePoints(SmsText.Extension())
+        for cp in SmsText.CodePoints(text) {
+            if (SmsText.Septets(basic, ext, cp) == 0) { return false }
+        }
+        return true
+    }
+
+    // Length in the units of its encoding : septets (GSM 7-bit) or
+    // UTF-16 code units (UCS-2, a code point above U+FFFF counts 2).
+    public static int Units(text: string) {
+        let basic: List<int> = SmsText.CodePoints(SmsText.Basic())
+        let ext: List<int> = SmsText.CodePoints(SmsText.Extension())
+        let cps: List<int> = SmsText.CodePoints(text)
+        var gsm: int = 0
+        var ucs: int = 0
+        var isGsm: bool = true
+        for cp in cps {
+            let s: int = SmsText.Septets(basic, ext, cp)
+            if (s == 0) { isGsm = false }
+            gsm = gsm + s
+            if (cp > 65535) { ucs = ucs + 2 } else { ucs = ucs + 1 }
+        }
+        if (isGsm) { return gsm }
+        return ucs
+    }
+
+    // Number of SMS the text is sent as : 160 / 153 per part in GSM
+    // 7-bit, 70 / 67 in UCS-2.
+    public static int Segments(text: string) {
+        let u: int = SmsText.Units(text)
+        if (u == 0) { return 1 }
+        var single: int = 160
+        var part: int = 153
+        if (!SmsText.IsGsm7(text)) {
+            single = 70
+            part = 67
+        }
+        if (u <= single) { return 1 }
+        return (u + part - 1) / part
+    }
+
+    // Replacement in GSM 7-bit of a code point outside it ("" : none).
+    public static string Translit(cp: int) {
+        let from: List<int> = SmsText.CodePoints("âêîôûëïÿçœŒÀÂÊÎÔÛËÏÈÙÌÒÁÍÓÚáíóúÃãõÕ«»‘’‚‛“”„–—‐‑…°²³·•‹›×÷")
+        let to: List<string> = new List<string>()
+        for s in String.Split("a|e|i|o|u|e|i|y|c|oe|OE|A|A|E|I|O|U|E|I|E|U|I|O|A|I|O|U|a|i|o|u|A|a|o|O|\"|\"|'|'|'|'|\"|\"|\"|-|-|-|-|...|deg|2|3|.|-|<|>|x|/", "|") {
+            to.Add(s)
+        }
+        let n: int = from.Count()
+        for i in 0..n {
+            let f: int = from.Get(i)
+            if (f == cp) { return to.Get(i) }
+        }
+        if (cp == 160 || cp == 8239 || cp == 8201 || cp == 8194 || cp == 8195) { return " " }   // no-break, narrow, thin, en, em spaces
+        return ""
+    }
+
+    // The text in GSM 7-bit : transliterated where it can be ("ê" → "e",
+    // "m³" → "m3", "«" → "\""), "?" where it cannot.
+    public static string ToGsm7(text: string) {
+        let basic: List<int> = SmsText.CodePoints(SmsText.Basic())
+        let ext: List<int> = SmsText.CodePoints(SmsText.Extension())
+        let out: List<int> = new List<int>()
+        for cp in SmsText.CodePoints(text) {
+            if (SmsText.Septets(basic, ext, cp) > 0) { out.Add(cp) }
+            else {
+                let t: string = SmsText.Translit(cp)
+                if (String.Length(t) == 0) { out.Add(63) }
+                else { for c in SmsText.CodePoints(t) { out.Add(c) } }
+            }
+        }
+        return SmsText.FromCodePoints(out)
+    }
+
+    // ToGsm7, cut to fit in `segments` SMS ("..." marks the cut).
+    public static string Fit(text: string, segments: int) {
+        let g: string = SmsText.ToGsm7(text)
+        var max: int = 160
+        if (segments > 1) { max = 153 * segments }
+        if (SmsText.Units(g) <= max) { return g }
+        let basic: List<int> = SmsText.CodePoints(SmsText.Basic())
+        let ext: List<int> = SmsText.CodePoints(SmsText.Extension())
+        let out: List<int> = new List<int>()
+        var used: int = 0
+        for cp in SmsText.CodePoints(g) {
+            let s: int = SmsText.Septets(basic, ext, cp)
+            if (used + s <= max - 3) {
+                out.Add(cp)
+                used = used + s
+            }
+        }
+        return SmsText.FromCodePoints(out) + "..."
+    }
+}
+
+// ── Phone numbers ────────────────────────────────────────────────
+public class Phone {
+    // E.164 ("+33612345678") from what people type : spaces, dots,
+    // dashes, slashes and brackets are dropped, "00" becomes "+", and a
+    // national number ("06 12 34 56 78") takes the country code (digits,
+    // "33"). "" when it is not a phone number.
+    public static string E164(s: string, country: string) {
+        var d: string = ""
+        var plus: bool = false
+        let n: int = String.Length(s)
+        for i in 0..n {
+            let c: string = String.Substring(s, i, 1)
+            if (String.Contains("0123456789", c)) { d = d + c }
+            else if (c == "+" && String.Length(d) == 0 && !plus) { plus = true }
+            else if (!String.Contains(" .-/()", c)) {
+                let code: List<int> = Bytes.FromString(c)
+                let b: int = code.Get(0)
+                // Bytes of a non-ASCII space (U+00A0, U+202F) are skipped, anything else refuses.
+                if (b < 128) { return "" }
+            }
+        }
+        if (!plus) {
+            if (String.StartsWith(d, "00")) { d = String.Substring(d, 2, String.Length(d) - 2) }
+            else if (String.StartsWith(d, "0") && String.Length(country) > 0) { d = country + String.Substring(d, 1, String.Length(d) - 1) }
+            else { return "" }
+        }
+        let len: int = String.Length(d)
+        if (len < 8 || len > 15 || String.StartsWith(d, "0")) { return "" }
+        return "+" + d
+    }
+}
+
+// ── Escaping ─────────────────────────────────────────────────────
+public class SmsEscape {
+    // Inside a JSON string (without the quotes).
+    public static string Json(s: string) {
+        let out: List<int> = new List<int>()
+        let hex: string = "0123456789abcdef"
+        let bytes: List<int> = Bytes.FromString(s)
+        for b in bytes {
+            if (b == 34) { out.Add(92); out.Add(34) }
+            else if (b == 92) { out.Add(92); out.Add(92) }
+            else if (b == 10) { out.Add(92); out.Add(110) }
+            else if (b == 13) { out.Add(92); out.Add(114) }
+            else if (b == 9) { out.Add(92); out.Add(116) }
+            else if (b < 32) {
+                for c in Bytes.FromString("\\u00" + String.Substring(hex, b / 16, 1) + String.Substring(hex, b % 16, 1)) { out.Add(c) }
+            }
+            else { out.Add(b) }
+        }
+        return Bytes.ToString(out)
+    }
+
+    // Percent-encoding (RFC 3986 unreserved kept), for forms and URLs.
+    public static string Url(s: string) {
+        let hex: string = "0123456789ABCDEF"
+        var out: string = ""
+        let bytes: List<int> = Bytes.FromString(s)
+        for b in bytes {
+            let keep: bool = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 46 || b == 95 || b == 126
+            if (keep) {
+                let one: List<int> = new List<int>()
+                one.Add(b)
+                out = out + Bytes.ToString(one)
+            } else {
+                out = out + "%" + String.Substring(hex, b / 16, 1) + String.Substring(hex, b % 16, 1)
+            }
+        }
+        return out
+    }
+
+    // Standard base64 (for HTTP Basic auth), from crypto's base64url.
+    public static string Base64(s: string) {
+        var b: string = String.Replace(String.Replace(Bytes.ToBase64Url(Bytes.FromString(s)), "-", "+"), "_", "/")
+        while (String.Length(b) % 4 != 0) { b = b + "=" }
+        return b
+    }
+}
+
+// ── Gateways ─────────────────────────────────────────────────────
+public class SmsGateway {
+    public Kind: string          // "sms-gate", "twilio", "template"
+    public Url: string
+    public User: string
+    public Password: string
+    public From: string
+    public Method: string
+    public ContentType: string
+    public Template: string
+
+    public SmsGateway() {
+        this.Kind = "template"
+        this.Url = ""
+        this.User = ""
+        this.Password = ""
+        this.From = ""
+        this.Method = "POST"
+        this.ContentType = "application/json"
+        this.Template = ""
+    }
+
+    // SMS Gateway for Android, local server : url = "http://<phone>:8080"
+    // (or through `adb forward tcp:8080 tcp:8080` : "http://127.0.0.1:8080").
+    // user / password : the ones the app shows on its Local Server card.
+    public static SmsGateway SmsGate(url: string, user: string, password: string) {
+        let g: SmsGateway = new SmsGateway()
+        g.Kind = "sms-gate"
+        g.Url = url
+        g.User = user
+        g.Password = password
+        return g
+    }
+
+    // Twilio Programmable Messaging : from = a Twilio number (E.164) or a
+    // Messaging Service sender.
+    public static SmsGateway Twilio(accountSid: string, authToken: string, from: string) {
+        let g: SmsGateway = new SmsGateway()
+        g.Kind = "twilio"
+        g.Url = "https://api.twilio.com/2010-04-01/Accounts/" + accountSid + "/Messages.json"
+        g.User = accountSid
+        g.Password = authToken
+        g.From = from
+        g.ContentType = "application/x-www-form-urlencoded"
+        return g
+    }
+
+    // Any HTTP gateway. {to}, {text} and {from} in the URL are
+    // percent-encoded ; in the body, JSON-escaped when contentType is
+    // JSON, percent-encoded otherwise. GET sends no body.
+    public static SmsGateway Template(method: string, url: string, contentType: string, body: string) {
+        let g: SmsGateway = new SmsGateway()
+        g.Method = method
+        g.Url = url
+        g.ContentType = contentType
+        g.Template = body
+        return g
+    }
+
+    public SmsGateway WithBasicAuth(user: string, password: string) {
+        this.User = user
+        this.Password = password
+        return this
+    }
+
+    public SmsGateway WithFrom(from: string) {
+        this.From = from
+        return this
+    }
+
+    public static string Fill(t: string, to: string, text: string, from: string, json: bool) {
+        // Placeholders built by concatenation : a literal {to} would be interpolated by amc.
+        let pTo: string = "{" + "to}"
+        let pText: string = "{" + "text}"
+        let pFrom: string = "{" + "from}"
+        if (json) {
+            return String.Replace(String.Replace(String.Replace(t, pTo, SmsEscape.Json(to)), pFrom, SmsEscape.Json(from)), pText, SmsEscape.Json(text))
+        }
+        return String.Replace(String.Replace(String.Replace(t, pTo, SmsEscape.Url(to)), pFrom, SmsEscape.Url(from)), pText, SmsEscape.Url(text))
+    }
+
+    // The HTTP request Send would make (tests, logs).
+    public HttpRequestBuilder Build(to: string, text: string) {
+        if (this.Kind == "sms-gate") {
+            var base: string = this.Url
+            if (String.EndsWith(base, "/")) { base = String.Substring(base, 0, String.Length(base) - 1) }
+            let b: HttpRequestBuilder = HttpClient.Request("POST", base + "/message")
+            b.BodyJson("{\"textMessage\":{\"text\":\"" + SmsEscape.Json(text) + "\"},\"phoneNumbers\":[\"" + SmsEscape.Json(to) + "\"]}")
+            this.Auth(b)
+            return b
+        }
+        if (this.Kind == "twilio") {
+            let b: HttpRequestBuilder = HttpClient.Request("POST", this.Url)
+            b.BodyText("To=" + SmsEscape.Url(to) + "&From=" + SmsEscape.Url(this.From) + "&Body=" + SmsEscape.Url(text))
+            b.Header("Content-Type", this.ContentType)
+            this.Auth(b)
+            return b
+        }
+        let b: HttpRequestBuilder = HttpClient.Request(this.Method, SmsGateway.Fill(this.Url, to, text, this.From, false))
+        if (this.Method != "GET") {
+            b.BodyText(SmsGateway.Fill(this.Template, to, text, this.From, String.Contains(this.ContentType, "json")))
+            b.Header("Content-Type", this.ContentType)
+        }
+        this.Auth(b)
+        return b
+    }
+
+    public void Auth(b: HttpRequestBuilder) {
+        if (String.Length(this.User) > 0) {
+            b.Header("Authorization", "Basic " + SmsEscape.Base64(this.User + ":" + this.Password))
+        }
+    }
+
+    // Sends one SMS to `to` (E.164 : see Phone.E164). The gateway's
+    // acceptance, not the delivery : SMS Gateway for Android and Twilio
+    // give a message id for that (r.Id).
+    public SmsResult Send(to: string, text: string) {
+        if (String.Length(to) == 0 || !String.StartsWith(to, "+")) { return new SmsResult(-1, "", "number not in E.164 (+33...) : see Phone.E164") }
+        if (String.Length(text) == 0) { return new SmsResult(-1, "", "empty text") }
+        let b: HttpRequestBuilder = this.Build(to, text)
+        let resp: HttpResponse = b.Send()
+        let status: int = resp.StatusCode
+        let body: string = resp.BodyText
+        var err: string = ""
+        if (status == 0) { err = "gateway unreachable : " + body }
+        else if (status < 200 || status >= 300) { err = "gateway answered " + String.FromInt(status) }
+        let r: SmsResult = new SmsResult(status, body, err)
+        if (r.Ok) {
+            let j: JsonResult = Json.Parse(body)
+            if (j.Ok) {
+                let v: JsonValue = j.Value
+                let id: JsonValue = v.Get("id")
+                let sid: JsonValue = v.Get("sid")
+                let ids: string = id.AsString()
+                if (String.Length(ids) > 0) { r.Id = ids } else { r.Id = sid.AsString() }
+            }
+        }
+        return r
+    }
+}
