@@ -84,7 +84,10 @@ public class SmsText {
 
     public static string FromCodePoints(cps: List<int>) {
         let b: List<int> = new List<int>()
-        for cp in cps {
+        let l1: List<int> = cps
+        let n1: int = l1.Count()
+        for i1 in 0..n1 {
+            let cp: int = l1.Get(i1)
             if (cp < 128) { b.Add(cp) }
             else if (cp < 2048) {
                 b.Add(192 + cp / 64)
@@ -104,7 +107,10 @@ public class SmsText {
     }
 
     public static bool In(set: List<int>, cp: int) {
-        for x in set {
+        let l2: List<int> = set
+        let n2: int = l2.Count()
+        for i2 in 0..n2 {
+            let x: int = l2.Get(i2)
             if (x == cp) { return true }
         }
         return false
@@ -120,7 +126,10 @@ public class SmsText {
     public static bool IsGsm7(text: string) {
         let basic: List<int> = SmsText.CodePoints(SmsText.Basic())
         let ext: List<int> = SmsText.CodePoints(SmsText.Extension())
-        for cp in SmsText.CodePoints(text) {
+        let l3: List<int> = SmsText.CodePoints(text)
+        let n3: int = l3.Count()
+        for i3 in 0..n3 {
+            let cp: int = l3.Get(i3)
             if (SmsText.Septets(basic, ext, cp) == 0) { return false }
         }
         return true
@@ -135,7 +144,10 @@ public class SmsText {
         var gsm: int = 0
         var ucs: int = 0
         var isGsm: bool = true
-        for cp in cps {
+        let l4: List<int> = cps
+        let n4: int = l4.Count()
+        for i4 in 0..n4 {
+            let cp: int = l4.Get(i4)
             let s: int = SmsText.Septets(basic, ext, cp)
             if (s == 0) { isGsm = false }
             gsm = gsm + s
@@ -182,12 +194,22 @@ public class SmsText {
         let basic: List<int> = SmsText.CodePoints(SmsText.Basic())
         let ext: List<int> = SmsText.CodePoints(SmsText.Extension())
         let out: List<int> = new List<int>()
-        for cp in SmsText.CodePoints(text) {
+        let l5: List<int> = SmsText.CodePoints(text)
+        let n5: int = l5.Count()
+        for i5 in 0..n5 {
+            let cp: int = l5.Get(i5)
             if (SmsText.Septets(basic, ext, cp) > 0) { out.Add(cp) }
             else {
                 let t: string = SmsText.Translit(cp)
                 if (String.Length(t) == 0) { out.Add(63) }
-                else { for c in SmsText.CodePoints(t) { out.Add(c) } }
+                else {
+                    let tc: List<int> = SmsText.CodePoints(t)
+                    let tn: int = tc.Count()
+                    for ti in 0..tn {
+                        let c: int = tc.Get(ti)
+                        out.Add(c)
+                    }
+                }
             }
         }
         return SmsText.FromCodePoints(out)
@@ -203,7 +225,10 @@ public class SmsText {
         let ext: List<int> = SmsText.CodePoints(SmsText.Extension())
         let out: List<int> = new List<int>()
         var used: int = 0
-        for cp in SmsText.CodePoints(g) {
+        let l6: List<int> = SmsText.CodePoints(g)
+        let n6: int = l6.Count()
+        for i6 in 0..n6 {
+            let cp: int = l6.Get(i6)
             let s: int = SmsText.Septets(basic, ext, cp)
             if (used + s <= max - 3) {
                 out.Add(cp)
@@ -253,14 +278,22 @@ public class SmsEscape {
         let out: List<int> = new List<int>()
         let hex: string = "0123456789abcdef"
         let bytes: List<int> = Bytes.FromString(s)
-        for b in bytes {
+        let l7: List<int> = bytes
+        let n7: int = l7.Count()
+        for i7 in 0..n7 {
+            let b: int = l7.Get(i7)
             if (b == 34) { out.Add(92); out.Add(34) }
             else if (b == 92) { out.Add(92); out.Add(92) }
             else if (b == 10) { out.Add(92); out.Add(110) }
             else if (b == 13) { out.Add(92); out.Add(114) }
             else if (b == 9) { out.Add(92); out.Add(116) }
             else if (b < 32) {
-                for c in Bytes.FromString("\\u00" + String.Substring(hex, b / 16, 1) + String.Substring(hex, b % 16, 1)) { out.Add(c) }
+                let l8: List<int> = Bytes.FromString("\\u00" + String.Substring(hex, b / 16, 1) + String.Substring(hex, b % 16, 1))
+                let n8: int = l8.Count()
+                for i8 in 0..n8 {
+                    let c: int = l8.Get(i8)
+                    out.Add(c)
+                }
             }
             else { out.Add(b) }
         }
@@ -272,7 +305,10 @@ public class SmsEscape {
         let hex: string = "0123456789ABCDEF"
         var out: string = ""
         let bytes: List<int> = Bytes.FromString(s)
-        for b in bytes {
+        let l9: List<int> = bytes
+        let n9: int = l9.Count()
+        for i9 in 0..n9 {
+            let b: int = l9.Get(i9)
             let keep: bool = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 46 || b == 95 || b == 126
             if (keep) {
                 let one: List<int> = new List<int>()
