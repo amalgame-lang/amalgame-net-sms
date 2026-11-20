@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.0 — 2026-11-20
+
+- `SmsGateway.Status(id)` / `SmsStatus` : where a sent message is
+  (pending, sent, delivered, failed with the reason, unknown), for SMS
+  Gateway for Android and Twilio ; `CanTrack()`. A 202 from the gateway
+  only means queued : found with a real phone that lacked the SMS
+  permission, the gateway accepted and the SMS never left.
+- Tests : 50 checks.
+
 ## v0.1.0 — 2026-11-19
 
 - `SmsGateway` : SMS Gateway for Android (local server), Twilio, and any

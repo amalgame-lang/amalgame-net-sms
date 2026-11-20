@@ -20,12 +20,28 @@ if (!r.Ok) { Console.WriteError(r.Error) }                        // r.StatusCod
 | `SmsGateway.Template(method, url, contentType, body)` | any other HTTP gateway : 4G routers, operators | `{to}`, `{text}`, `{from}` in the URL (percent-encoded) and the body (JSON-escaped when the content type is JSON, percent-encoded otherwise) ; `.WithBasicAuth(user, password)`, `.WithFrom(sender)` |
 
 `Send` reports the gateway's **acceptance** (2xx, with its message id in
-`r.Id` when it gives one), not the delivery to the handset : that comes
-later from the gateway (SMS Gateway for Android : delivery reports and
-webhooks ; Twilio : status callbacks). `StatusCode` is 0 when the
+`r.Id` when it gives one), not the sending : `StatusCode` is 0 when the
 gateway cannot be reached, -1 when the request is refused before
 sending (number not in E.164, empty text). `Build(to, text)` returns the
 request without sending it.
+
+### Accepted is not sent : `Status`
+
+A gateway that answered 202 has only queued the message. The phone may
+then fail to send it (no SMS permission, no network, switched off) and
+nobody knows, unless someone asks. `gw.Status(r.Id)` asks :
+
+```amalgame
+let s: SmsStatus = gw.Status(r.Id)
+// s.State : "pending", "sent", "delivered", "failed", "unknown"
+// s.Error : why it failed ("... does not have android.permission.SEND_SMS")
+// s.Final() : delivered or failed, nothing more will change
+```
+
+SMS Gateway for Android (`GET <url>/message/<id>`) and Twilio
+(`GET …/Messages/<sid>.json`) states are mapped to the same five words
+(`SmsStatus.Normalize`). Template gateways cannot be followed
+(`gw.CanTrack()` is false, the state is `unknown`).
 
 ### A phone over USB
 
@@ -61,11 +77,13 @@ for E.164, give `""`.
 ./tests/run_am_tests.sh [amc]
 ```
 
-38 checks : the alphabet and segment counts, transliteration, E.164,
+50 checks : the alphabet and segment counts, transliteration, E.164,
 escaping, the exact request of each gateway, and `Send` against a stand-in
 for SMS Gateway for Android (`tests/fake_gateway.py`, python3) : accepted
 with its id, 401 on a wrong password, unreachable gateway, number refused
-before sending, and the message as received by the gateway.
+before sending, and the message as received by the gateway. `Status` :
+delivered, failed on the phone with its reason (accepted all the same),
+pending, unknown id, unreachable gateway, template gateway.
 
 ## Dependencies
 

@@ -43,6 +43,42 @@ public class SmsResult {
     }
 }
 
+// Where one sent message is, from the gateway (SmsGateway.Status).
+// A gateway that accepted a message (202) has not sent it : the phone
+// may lack the SMS permission, be off, or out of network. Only this
+// says whether the SMS left and arrived.
+public class SmsStatus {
+    public State: string       // "pending", "sent", "delivered", "failed", "unknown"
+    public Raw: string         // the gateway's own state ("Processed", "undelivered"...)
+    public Error: string       // why it failed, or why the state is unknown
+    public StatusCode: int     // HTTP status of the query ; 0 : gateway unreachable
+
+    public SmsStatus(state: string, raw: string, error: string, status: int) {
+        this.State = state
+        this.Raw = raw
+        this.Error = error
+        this.StatusCode = status
+    }
+
+    // Delivered or failed : nothing more will change.
+    public bool Final() {
+        return this.State == "delivered" || this.State == "failed"
+    }
+
+    // The gateway's state in the common vocabulary.
+    //   SMS Gateway for Android : Pending, Processed / Sent / Delivered / Failed
+    //   Twilio : queued, accepted, scheduled, sending / sent / delivered /
+    //            undelivered, failed, canceled
+    public static string Normalize(raw: string) {
+        let s: string = String.ToLower(raw)
+        if (s == "pending" || s == "processed" || s == "queued" || s == "accepted" || s == "scheduled" || s == "sending") { return "pending" }
+        if (s == "sent") { return "sent" }
+        if (s == "delivered") { return "delivered" }
+        if (s == "failed" || s == "undelivered" || s == "canceled") { return "failed" }
+        return "unknown"
+    }
+}
+
 // ── Text : GSM 03.38, segments, transliteration ──────────────────
 public class SmsText {
     // GSM 03.38 basic table (one septet each), escape excluded.
@@ -467,5 +503,59 @@ public class SmsGateway {
             }
         }
         return r
+    }
+
+    // Whether Status can follow a message on this gateway.
+    public bool CanTrack() {
+        return this.Kind == "sms-gate" || this.Kind == "twilio"
+    }
+
+    // Where the message `id` (SmsResult.Id) is : sent by the phone,
+    // delivered to the handset, or failed and why. "unknown" when the
+    // gateway cannot say (template gateways, unreachable, unknown id).
+    public SmsStatus Status(id: string) {
+        if (!this.CanTrack()) { return new SmsStatus("unknown", "", "this gateway gives no delivery state", -1) }
+        if (String.Length(id) == 0) { return new SmsStatus("unknown", "", "no message id", -1) }
+        var url: string = ""
+        if (this.Kind == "sms-gate") {
+            var base: string = this.Url
+            if (String.EndsWith(base, "/")) { base = String.Substring(base, 0, String.Length(base) - 1) }
+            url = base + "/message/" + SmsEscape.Url(id)
+        } else {
+            // .../Messages.json -> .../Messages/<sid>.json
+            url = String.Substring(this.Url, 0, String.Length(this.Url) - 5) + "/" + SmsEscape.Url(id) + ".json"
+        }
+        let b: HttpRequestBuilder = HttpClient.Request("GET", url)
+        this.Auth(b)
+        let resp: HttpResponse = b.Send()
+        let status: int = resp.StatusCode
+        let body: string = resp.BodyText
+        if (status == 0) { return new SmsStatus("unknown", "", "gateway unreachable : " + body, 0) }
+        if (status < 200 || status >= 300) { return new SmsStatus("unknown", "", "gateway answered " + String.FromInt(status), status) }
+        let j: JsonResult = Json.Parse(body)
+        if (!j.Ok) { return new SmsStatus("unknown", "", "not JSON", status) }
+        let v: JsonValue = j.Value
+        var raw: string = ""
+        var err: string = ""
+        if (this.Kind == "sms-gate") {
+            let st: JsonValue = v.Get("state")
+            raw = st.AsString()
+            let rs: JsonValue = v.Get("recipients")
+            let r0: JsonValue = rs.At(0)
+            let e0: JsonValue = r0.Get("error")
+            err = e0.AsString()
+        } else {
+            let st: JsonValue = v.Get("status")
+            raw = st.AsString()
+            let em: JsonValue = v.Get("error_message")
+            err = em.AsString()
+            if (String.Length(err) == 0) {
+                let ec: JsonValue = v.Get("error_code")
+                if (ec.IsInt()) { err = "error " + String.FromInt(ec.AsInt()) }
+            }
+        }
+        let state: string = SmsStatus.Normalize(raw)
+        if (state == "unknown" && String.Length(err) == 0) { err = "unknown state " + raw }
+        return new SmsStatus(state, raw, err, status)
     }
 }

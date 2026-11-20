@@ -80,6 +80,13 @@ public class Program {
         let b4: HttpRequestBuilder = tj.Build("+33612345678", "a\"b")
         Program.Eq("template JSON : body", b4.Body, "{\"to\":\"+33612345678\",\"msg\":\"a\\\"b\",\"from\":\"KAIROS\"}")
 
+        // ── Delivery states, common vocabulary ──
+        Program.Eq("Normalize : SMS Gateway Processed", SmsStatus.Normalize("Processed"), "pending")
+        Program.Eq("Normalize : SMS Gateway Sent", SmsStatus.Normalize("Sent"), "sent")
+        Program.Eq("Normalize : Twilio undelivered", SmsStatus.Normalize("undelivered"), "failed")
+        Program.Eq("Normalize : Twilio delivered", SmsStatus.Normalize("delivered"), "delivered")
+        Program.Eq("Normalize : anything else", SmsStatus.Normalize("weird"), "unknown")
+
         // ── Send, against the fake gateway ──
         if (Args_Count() > 1) {
             let port: string = Args_Get(1)
@@ -95,6 +102,23 @@ public class Program {
             Program.Check("Send : unreachable gateway is status 0", !r3.Ok && r3.StatusCode == 0)
             let r4: SmsResult = gw.Send("0612345678", "x")
             Program.Check("Send : a number not in E.164 is refused before sending", !r4.Ok && r4.StatusCode == -1)
+
+            // ── Status : accepted is not sent ──
+            let s1: SmsStatus = gw.Status(r.Id)
+            Program.Check("Status : the accepted message was delivered (" + s1.Raw + s1.Error + ")", s1.State == "delivered" && s1.Final())
+            let rf: SmsResult = gw.Send("+33612345678", "[st] FAIL")
+            Program.Check("Status : a refused send is still accepted by the gateway (202)", rf.Ok)
+            let sf: SmsStatus = gw.Status(rf.Id)
+            Program.Check("Status : ... but the phone failed, and says why", sf.State == "failed" && sf.Final() && String.Contains(sf.Error, "SEND_SMS"))
+            let rs: SmsResult = gw.Send("+33612345678", "[st] STUCK")
+            let ss: SmsStatus = gw.Status(rs.Id)
+            Program.Check("Status : a message the phone has not sent is pending, not final", ss.State == "pending" && !ss.Final())
+            let su: SmsStatus = gw.Status("m-999")
+            Program.Check("Status : an unknown id is unknown (404)", su.State == "unknown" && su.StatusCode == 404)
+            let so: SmsStatus = off.Status("m-42")
+            Program.Check("Status : unreachable gateway is unknown, status 0", so.State == "unknown" && so.StatusCode == 0)
+            let st: SmsStatus = tg.Status("x")
+            Program.Check("Status : a template gateway cannot track", !tg.CanTrack() && st.State == "unknown")
         } else {
             Console.WriteLine("[FAIL] no fake gateway port in argument 1")
         }
